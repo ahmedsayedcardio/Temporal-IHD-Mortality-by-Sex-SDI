@@ -1,0 +1,1323 @@
+---
+title: "Ischemic heart disease mortality rates and the interaction of sex, time, and socioeconomic developemnt"
+subtitle: "An Analysis of the Global Burden of Disease Study"
+format: 
+  html:
+    toc: true
+    toc-expand: true
+    toc-location: body
+date: 5-13-2024
+theme: lightly
+author:
+  - name: "Ahmed Sayed (asu.ahmed.sayed@gmail.com)"
+    affiliations: "Ain Shams University, Faculty of Medicine"
+embed-resources: true
+toc: true
+toc-expand: 2
+toc-title: Contents
+page-layout: full
+code-fold: true
+editor: visual
+---
+
+# Code Blocks
+
+## Libraries & Functions
+
+### Import Libraries
+
+```{r}
+#Libraries
+packs <- c(
+  #Foreach function
+  "doParallel",
+ #Data cleaning/manipulation
+ "dplyr", "tidyr", "data.table", "janitor", "qs",
+ #String and factor manipulation
+ "stringr", "forcats",
+ #ggplot
+ "ggplot2", "ggpubr", "ggthemes", "gt", "patchwork",
+ #Analytic
+ "mgcv", "emmeans","marginaleffects", "brms",
+ #Misc
+ "Hmisc", "bstfun")
+lapply(packs, require, character.only = TRUE)
+```
+
+### Define self-made functions
+
+#### Formatting aesthetics
+
+```{r}
+#Function to format P-values
+p <- function(p) {
+  ifelse(p < 0.001, "<0.001", ifelse(round(p, 2) == 0.05 | round(p, 2) == 0, round(p, 3) %>% format(nsmall = 3), round(p, 2) %>% format(nsmall = 2))) %>% as.character
+}
+
+#Add pe_ci without pct
+pe_ci <- function(data, pe = pe, lci = lci, uci = uci, rounding = 2) {
+  data %>%   mutate(pe_ci = paste0(
+    pe  %>% round(rounding) %>% format(nsmall = rounding), " (", 
+    lci %>% round(rounding) %>% format(nsmall = rounding), " to ",
+    uci  %>% round(rounding) %>% format(nsmall = rounding),
+    ")" 
+  ))
+}
+
+#Add pe_ci without pct (flipped LCI/UCI around to accomodate marginaleffect's default comparison ordering)
+abs_pe_ci <- function(data, pe = pe, lci = lci, uci = uci, rounding = 2) {
+  data %>%   mutate(pe_ci = paste0(
+    pe  %>% round(rounding) %>% format(nsmall = rounding), " (", 
+    uci %>% round(rounding) %>% format(nsmall = rounding), " to ",
+    lci  %>% round(rounding) %>% format(nsmall = rounding),
+    ")" 
+  ))
+}
+
+#Make stuff numeric
+make_numeric <- function(data, variables) {
+  data %>% mutate(across(any_of(variables), ~ as.numeric(.)))
+}
+
+#Make stuff factor
+make_factor <- function(data, variables) {
+  data %>% mutate(across(any_of(variables), ~ as.factor(.)))
+}
+```
+
+```{r}
+  sdi_contrasts <- function(model) { 
+  #Apply emmeans to get conditional contrasts by sex
+contrasts_df <- emmeans(model, pairwise ~ sdi|sex,
+                        at = list(year = year_of_analysis,
+                                  sdi = sdis_of_interest$sdi, 
+                                  sex = c("Male", "Female"))) %>%
+  {.$contrasts} %>%
+  confint(adjust = "none") %>%
+  data.frame %>%
+  filter(contrast %>% str_detect(paste0(" - sdi", sdis_of_interest$sdi %>% max))) %>%
+  rename(any_of(c("pe" = "estimate",
+                  "lci" = "lower.CL",
+                  "lci" = "lower.HPD",
+                  "uci" = "upper.CL",
+                  "uci" = "upper.HPD"))) %>%
+  #Exponentiate
+  mutate(across(.cols = c("pe", "lci", "uci"),
+                ~ . %>% exp)) %>%
+  #Create a "Compared to" SDI column
+  mutate(compared_to = contrast %>%  
+           word(1, sep = "-") %>%
+           str_remove_all("sdi") %>%
+           as.numeric) %>%
+  #Create a compared_to = reference row
+  add_row(.before = 1,
+          compared_to = sdis_of_interest$sdi %>% max,
+          contrast = paste0("sdi", sdis_of_interest$sdi %>% max,
+                  " - sdi", sdis_of_interest$sdi %>% max),
+          sex = c("Male", "Female") %>% factor,
+          pe = 1, lci = 1, uci = 1
+          ) %>%
+  pe_ci %>%
+  mutate(pe_ci = str_replace(pe_ci, "\\(", "\\(95% CI: ")) %>%
+  #Add the "comapred_to_percentile" variable (first mutate to character column)
+  mutate(compared_to = as.character(compared_to)) %>%
+  left_join(., 
+            sdis_of_interest %>%
+              mutate(sdi = as.character(sdi)),
+          by = c("compared_to" = "sdi")) %>%
+  mutate(compared_to = as.numeric(compared_to)
+         )
+}
+
+```
+
+#### Calculating contrasts
+
+##### Sex-stratified temporal changes
+
+```{r}
+##Create a function to get sex-stratified temporal according to SDI
+temporal_change <- function(model,
+                            years_of_interest = 1981:2021,
+                            sdi_quantile_names = c("low_sdi",
+                                                   "average_sdi",
+                                                   "high_sdi")) {
+##Set up 2 loops
+
+#Set up dataframe to store the results of the overall loop
+ihd_trends <- data.frame()
+
+#One for SDI level
+for(sdi_quantile_name in sdi_quantile_names) {
+
+  #Set up another dataframe to store the results of the intermediate loop
+  ihd_trends_sdi <- data.frame()
+  
+#And a nested one for year
+for(year_of_interest in years_of_interest) {
+######
+
+  ihd_trends_sdi <- emmeans(model, 
+                            pairwise ~ (sdi & year)|sex,#Contrasts of interest
+                            nesting = NULL,
+                            at = list(year = c(1980, year_of_interest) %>%
+                                        rev,  #Filter to the years of interest and reverse
+                    sdi = sdi_by_year %>%
+                      filter(year %in% c(1980, year_of_interest)) %>%
+                      pull(sdi_quantile_name))) %>% #Filter to SDI of interest
+                    {.$contrasts} %>% #Extract contrasts
+                    confint(adjust = "none") %>% #Do not adjust the CI
+                    data.frame %>% #Convert to a dataframe
+                    filter(contrast %>%
+                             str_detect(paste0("- sdi", sdi_by_year %>% filter(year == 1980) %>%
+                                                 pull(sdi_quantile_name), " year1980"))) %>% #Exclude rows where the year after 1980 is the reference
+                    filter(contrast %>%
+                             str_detect(paste0("^sdi", sdi_by_year %>% filter(year == 1980) %>%
+                                                 pull(sdi_quantile_name)), negate = T)) %>% #Exclude rows which assume the same SDI in 2021 as in 1980
+                    rename(any_of(
+                      c("pe" = "estimate",
+                        "lci" = "lower.CL",
+                        "lci" = "lower.HPD",
+                        "uci" = "upper.CL",
+                        "uci" = "upper.HPD"))) %>%
+                    mutate(across(.cols = c("pe", "lci", "uci"), #Exponentiate
+                        ~ . %>% exp)) %>%
+                    mutate(sdi_level = sdi_quantile_name,
+                    compared_to = word(contrast, 2) %>% str_remove("year")) %>%
+                        rbind(ihd_trends_sdi, .)
+ }
+ihd_trends <- rbind(ihd_trends, ihd_trends_sdi)
+######
+                      }
+
+
+#Add 1980 as a reference year (will have a ratio of 1 since it is being compared to itself)
+ihd_trends <- ihd_trends %>%
+  make_numeric("compared_to") %>%
+  add_row(.before = 1,
+  compared_to = 1980 %>% rep(6),
+  pe = 1 %>% rep(6),
+  lci = 1 %>% rep(6),
+  uci = 1 %>% rep(6),
+  sdi_level = c("low_sdi", "average_sdi", "high_sdi") %>% rep(2),
+  sex = c("Female", "Male") %>% rep(each = 3)
+  ) %>%
+  #Add pe_ci as a column
+  pe_ci %>%
+  mutate(pe_ci = pe_ci %>%
+  str_replace(" \\(", "; 95% CI: ") %>%
+  str_remove("\\)") %>%
+  paste0("rate ratio: ", .))
+}
+```
+
+##### Sex-stratified SDI disparities
+
+```{r}
+  sdi_contrasts <- function(model) { 
+  #Apply emmeans to get conditional contrasts by sex
+emmeans(model, pairwise ~ sdi|sex,
+                        at = list(year = year_of_analysis,
+                                  sdi = sdis_of_interest$sdi, 
+                                  sex = c("Male", "Female"))) %>%
+  {.$contrasts} %>%
+  confint(adjust = "none") %>%
+  data.frame %>%
+  filter(contrast %>% str_detect(paste0(" - sdi", sdis_of_interest$sdi %>% max))) %>%
+  rename(any_of(c("pe" = "estimate",
+                  "lci" = "lower.CL",
+                  "lci" = "lower.HPD",
+                  "uci" = "upper.CL",
+                  "uci" = "upper.HPD"))) %>%
+  #Exponentiate
+  mutate(across(.cols = c("pe", "lci", "uci"),
+                ~ . %>% exp)) %>%
+  #Create a "Compared to" SDI column
+  mutate(compared_to = contrast %>%  
+           word(1, sep = "-") %>%
+           str_remove_all("sdi") %>%
+           as.numeric) %>%
+  #Create a compared_to = reference row
+  add_row(.before = 1,
+          compared_to = sdis_of_interest$sdi %>% max,
+          contrast = paste0("sdi", sdis_of_interest$sdi %>% max,
+                  " - sdi", sdis_of_interest$sdi %>% max),
+          sex = c("Male", "Female") %>% factor,
+          pe = 1, lci = 1, uci = 1
+          ) %>%
+  pe_ci %>%
+  mutate(pe_ci = str_replace(pe_ci, "\\(", "\\(95% CI: ")) %>%
+  #Add the "comapred_to_percentile" variable (first mutate to character column)
+  mutate(compared_to = as.character(compared_to)) %>%
+  left_join(., 
+            sdis_of_interest %>%
+              mutate(sdi = as.character(sdi)),
+          by = c("compared_to" = "sdi")) %>%
+  mutate(compared_to = as.numeric(compared_to)
+         )
+}
+```
+
+#### Plots
+
+##### Ratios
+
+```{r}
+plot_contrasts <- function(contrasts = contrasts_df, year) {
+
+#Set line_color and width
+line_color = "maroon"
+line_width = 1.5
+
+#Set attributable risk factor
+attribution <- if(risk_factor %>% is.null) {
+  " "
+} else if(!is.null(risk_factor)) {
+  paste0(" (attributable to ", risk_factor, ") ")
+  
+}
+
+#Set titles
+xtitle <- "Sociodemographic Index"
+ytitle <- "Mortality rate ratio"
+main_title <- paste0("Sex-stratified association of the sociodemographic index with IHD mortality", attribution %>% tolower, "in ", year, ".")
+subtitle <- "Lines represent the sex-stratified mortality rate ratio comparing a given SDI to an SDI of 0.8. A higher position on the Y-axis indicates greater excess mortality associated with a low sociodemographic index."
+
+#Set steps for x and y axes
+xbreaks <- seq(0.2, 0.8, 0.05)
+ybreaks <- if(year == 2021 & (!is.null(risk_factor) && risk_factor == "Environmental/occupational risks")) {seq(0.0, 10, 0.4)} else {seq(0.0, 10, 0.2)}
+#Adjust aesthetics for 1980 specifically (otherwise ribbon gets cutoff)
+ylimits <- if(year == 1980) {c(0.5, 2)} else {c(NA, NA)}
+
+#Plot!
+ggplot(data = contrasts,
+              aes(x = compared_to,
+                  y = pe,
+                  ymin = lci,
+                  ymax = uci,
+                  col = sex,
+                  fill = sex,
+                  group = sex)) +
+  #Add Lines & Ribbons
+  geom_smooth(method = "gam",
+              lwd = line_width,
+              se = FALSE) +
+  geom_ribbon(alpha = 0.15, lwd = 0) +
+  scale_color_tableau(name = NULL) +
+  scale_fill_tableau(name = NULL) +
+  #Add horizontal line
+  geom_hline(yintercept = 1, linewidth = 2, linetype = "dashed") +
+  #Add scales
+  scale_x_continuous(
+    name = xtitle,
+    breaks = xbreaks,
+    expand = c(0.0, 0.0)
+  ) +
+  scale_y_continuous(
+    name = ytitle,
+    breaks = ybreaks,
+    trans = "log"
+  ) +
+  #Add plot title
+  ggtitle(main_title,
+          subtitle = subtitle) +
+  #Theme
+  theme_pubclean() +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold",hjust = 0.0, size = 15),
+        plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.0, color = "grey45"),
+        axis.text.x = element_text(size = 20, face = "bold"),
+        axis.text.y = element_text(size = 20, face = "bold"),
+        axis.title.x = element_text(size = 25, face = "bold"),
+        axis.title.y = element_text(size = 25, face = "bold"),
+        axis.line = element_line(colour = "black", linewidth = 1.2),
+        plot.margin = margin(0.5, 1, 0.5, 1, "cm"),
+        legend.position = c(0.5, 0.97),
+        legend.text = element_text(face = "bold"),
+        legend.key.width = unit(2, "cm")) +
+  guides(colour = guide_legend(nrow = 1)) +
+  coord_cartesian(ylim = ylimits)
+}
+```
+
+##### Differences
+
+```{r}
+plot_abs_contrasts <- function(contrasts = abs_contrasts_df, year) {
+
+#Set line_color and width
+line_color = "maroon"
+line_width = 1.5
+
+#Set attributable risk factor
+attribution <- if(risk_factor %>% is.null) {
+  " "
+} else if(!is.null(risk_factor)) {
+  paste0(" (attributable to ", risk_factor, ") ")
+  
+}
+
+#Set titles
+xtitle <- "Sociodemographic Index"
+ytitle <- "Mortality rate difference (per 100,000)"
+main_title <- paste0("Sex-stratified association of the sociodemographic index with IHD mortality", attribution %>% tolower, "in ", year, ".")
+subtitle <- "Lines represent mortality rate differences per 100,000. A higher position on the Y-axis indicates greater excess mortality associated with a low sociodemographic index."
+
+#Set steps for x and y axes
+xbreaks <- seq(0.2, 0.8, 0.05)
+ybreaks <- seq(-150, 150, 10)
+#Adjust aesthetics for 1980 specifically (otherwise legend gets eaten up by the CI)
+ylimits <- if(year == 1980) {c(-110, 20)} else {c(NA, NA)}
+
+#Plot!
+ggplot(data = contrasts,
+              aes(x = compared_to %>% as.numeric,
+                  y = pe,
+                  ymin = lci,
+                  ymax = uci,
+                  col = sex,
+                  fill = sex,
+                  group = sex)) +
+  #Add Lines & Ribbons
+  geom_smooth(method = "gam",
+              lwd = line_width,
+              se = FALSE) +
+  geom_ribbon(alpha = 0.15, lwd = 0) +
+  scale_color_tableau(name = NULL) +
+  scale_fill_tableau(name = NULL) +
+  #Add horizontal line
+  geom_hline(yintercept = 0, linewidth = 2, linetype = "dashed") +
+  #Add scales
+  scale_x_continuous(
+    name = xtitle,
+    breaks = xbreaks,
+    expand = c(0.0, 0.0)
+  ) +
+  scale_y_continuous(
+    name = ytitle,
+    breaks = ybreaks
+  ) +
+  #Add plot title
+  ggtitle(main_title,
+          subtitle = subtitle) +
+  #Theme
+  theme_pubclean() +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold",hjust = 0.0, size = 15),
+        plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.0, color = "grey45"),
+        axis.text.x = element_text(size = 20, face = "bold"),
+        axis.text.y = element_text(size = 20, face = "bold"),
+        axis.title.x = element_text(size = 20, face = "bold"),
+        axis.title.y = element_text(size = 20, face = "bold"),
+        axis.line = element_line(colour = "black", linewidth = 1.2),
+        plot.margin = margin(0.5, 1, 0.5, 1, "cm"),
+        legend.position = c(0.5, 0.97),
+        legend.text = element_text(face = "bold"),
+        legend.key.width = unit(2, "cm")) +
+  guides(colour = guide_legend(nrow = 1)) +
+  coord_cartesian(ylim = ylimits)
+}
+```
+
+## Import & analyze data
+
+### Import data
+
+```{r}
+#Import SDIs and convert to longer format more suitable for analysis
+x_sdi <- read.csv("GBD_SDI.csv") %>%
+  filter(location_id != 533)  %>% #Remove Georgia (US State) since it's problematic as it gets mixed up with Georgia (Country)
+  rename(year = year_id,
+         location = location_name,
+         sdi = mean_value) %>% #Rename Location to location
+  make_numeric(c("year", "sdi")) %>%
+  select(location, year, sdi) %>%
+  filter(year %between% c(1980, 2021)) %>%
+  arrange(location, year)
+
+
+#Replace the names in the "x_sdi" locations column that differ from the AAMR file using our "Naming Differences..." sheet
+diff_names_df <- readxl::read_xlsx("Naming Differences Between the Mortality and the SDI Files.xlsx")
+for(sdi_name in diff_names_df$`SDI File`) {
+  
+  replacement_name <- diff_names_df$`Mortality File`[diff_names_df$`SDI File` == sdi_name]
+  
+  x_sdi$location[x_sdi$location == sdi_name] <- replacement_name
+  
+}
+
+#Remake into a factor
+x_sdi <- x_sdi %>% make_factor("location")
+
+#Import AAMR
+x_aamr <- read.csv(paste0("Sex_Stratified_IHD_AAMR.csv")) %>% 
+  rename(aamr_pe = val,
+         aamr_lci = lower,
+         aamr_uci = upper,
+         location = location_name,
+         sex = sex_name) %>%
+  select(location, year, contains("aamr"), sex) %>%
+  make_factor(c("location", "sex")) %>%
+  mutate(location = location %>% droplevels)
+
+x_acm <- read.csv(paste0("Sex_Stratified_ACM_AAMR.csv")) %>% 
+  rename(aamr_pe = val,
+         aamr_lci = lower,
+         aamr_uci = upper,
+         location = location_name,
+         sex = sex_name) %>%
+  select(location, year, contains("aamr"), sex) %>%
+  make_factor(c("location", "sex")) %>%
+  mutate(location = location %>% droplevels)
+
+#Import AAMR by risk factor
+rf_aamr <- read.csv("Sex_Stratified_IHD_AAMR_RF.csv") %>% 
+  rename(aamr_pe = val,
+         aamr_lci = lower,
+         aamr_uci = upper,
+         location = location_name,
+         sex = sex_name,
+         cause = cause_name,
+         riskfactor = rei_name) %>%
+  select(location, year, contains("aamr"), sex, riskfactor) %>%
+  make_factor(c("cod", "location", "sex", "riskfactor")) %>%
+  mutate(location = location %>% droplevels)
+
+#Set up the dataframe correctly for analysis (to account for autocorrelation)
+x_sdi <- x_sdi %>% arrange(location, year)
+x_sdi$ar_ind <- c(TRUE, 
+                  FALSE %>% rep(length(1981:2021))) %>%
+  rep(nrow(x_sdi)/length(1980:2021))
+
+#Join them together
+x <- left_join(x_aamr, x_sdi, by = c("location", "year"))
+x_acm <- left_join(x_acm, x_sdi, by = c("location", "year"))
+rf <- left_join(rf_aamr, x_sdi, by = c("location", "year"))
+
+#Get 0.1-0.9 quantiles
+sdi_quants <- x %>%
+  filter(year == 2021 & sex == "Male") %>%
+  pull(sdi) %>%
+  {.[!is.na(.)]} %>%
+  quantile(c(0.1, 0.9))
+
+#Arrange dataframes
+x <- x %>% arrange(location, sex, year)
+rf <- rf %>% arrange(riskfactor, location, sex, year)
+
+#Remove redundant dataframes
+rm(x_sdi, x_aamr, rf_aamr, diff_names_df)
+```
+
+### Overall Analysis
+
+#### Models
+
+##### Frequentist model
+
+```{r}
+#Run the overall model
+ihd_bam <- bam(data = x,
+               method = "fREML", #Use fast REML computation
+               AR.start = ar_ind, #Autocorrelation indicator*
+               rho = 0.99, #Autocorrelation coeffecient
+               discrete = TRUE, #Use discretization to speed up computation
+               family = Gamma(link = "log"), #Use a Gamma family with a log link
+               formula = aamr_pe ~ #AAMR (Age-adjusted mortality rate) is the outcome
+                 te(year, sdi, by = sex, k = 10, bs = "tp") + #A three-way interaction between year, SDI, and sex
+                 sex + #A main effects for sex (main effects for other continuous variables automatically included by the "te" function)
+                 s(location, bs = "re") #Use random-intercepts for countries.
+)
+
+#*The autocorrelation parameter was estimated in 2 separate models using the glmmTMB function of the glmmTMB package and the gamm function of the mgcv package with a similar distribution of parameters as the model specified above. Both models showed a correlation coeffecient of ~0.99. This was done because the bam function requires the specification of an autocorrelation parameter apriori rather than estimating it itself.
+
+#Check GAMs for basis dimensions that are too restrictive (to a meaningful extent)
+gam.check(ihd_bam)
+
+
+#Run the overall model for ACM
+acm_bam <- bam(data = x_acm,
+               method = "fREML", #Use fast REML computation
+               AR.start = ar_ind, #Autocorrelation indicator*
+               rho = 0.99, #Autocorrelation coeffecient
+               discrete = TRUE, #Use discretization to speed up computation
+               family = Gamma(link = "log"), #Use a Gamma family with a log link
+               formula = aamr_pe ~ #AAMR (Age-adjusted mortality rate) is the outcome
+                 te(year, sdi, by = sex, k = 10, bs = "tp") + #A three-way interaction between year, SDI, and sex
+                 sex + #A main effects for sex (main effects for other continuous variables automatically included by the "te" function)
+                 s(location, bs = "re") #Use random-intercepts for countries.
+)
+```
+
+##### Bayesian sensitivity analysis
+
+###### Setup
+
+```{r}
+#Create log AAMR and log AAMR SE
+x$log_aamr_se <- (log(x$aamr_uci) - log(x$aamr_lci))/3.92
+x$log_aamr_pe <- log(x$aamr_pe)
+
+#Use 10 cores
+options(mc.cores = 10)
+```
+
+###### Priors
+
+```{r}
+priors <- c(
+  prior(beta(1, 0.5), class = "ar", lb = 0, ub = 1),
+  prior(normal(5, 1), class = "Intercept"),
+  prior(normal(0, 1), class = "b", coef = "sexMale"),
+  prior(normal(0, 0.5), class = "b"),
+  prior(normal(0, 0.25), class = "sigma", lb = 0),
+  prior(normal(0, 1), class = "sds", lb = 0),
+  prior(normal(0, 1), class = "sd", lb = 0)
+)
+```
+
+###### Model the prior
+
+```{r}
+
+##Model the prior (Prior predictive checks) if necessary
+#This was done by inspecting the data distribution implied by the priors,
+#the contrasts implied by the priors, and the parameter values implied by the priors
+
+#If you would like to do this, switch this to TRUE and inspect the model based on the priors only below ("mprior")
+if(FALSE) {
+mprior <- brm(data = x,
+              family = "normal",
+              prior = priors,
+              bf(log_aamr_pe | se(log_aamr_se, sigma = TRUE) ~
+                   t2(sdi, year, by = sex) + 
+                   sex + 
+                   (1|location) +
+                   ar(time = year, 
+                      gr = location:sex,
+                      cov = TRUE),
+                 decomp = "QR"),
+              seed = 1,
+              cores = 4,
+             sample_prior = "only",
+              backend = "cmdstanr"
+)
+}
+```
+
+###### Model the posterior
+
+```{r}
+
+##Model the data using the priors above
+#Please note this can be quite time-intensive depending on your device's computational power!
+
+if(!file.exists("Bayesian Model.RData")) {
+  start <- Sys.time()
+mpost4 <- brm(data = x,
+              family = "normal",
+              prior = priors,
+              bf(log_aamr_pe | mi(log_aamr_se) ~
+                   t2(sdi, year, by = sex) + 
+                   sex + 
+                   (1|location) +
+                   ar(time = year, 
+                      gr = location:sex),
+                 decomp = "QR"),
+              stan_model_args = list(stanc_options = list("O1")),
+              seed = 1,
+              init = 0,
+              cores = 4,
+              backend = "cmdstanr"
+             )
+end <- Sys.time()
+start - end
+  qsave(mpost, "Bayesian Model (Sensitivity).RData") } else {
+  mpost <- qread("Bayesian Model (Sensitivity).RData")
+}
+```
+
+#### Temporal change stratified by sex and SDI
+
+```{r}
+#Calculate SDI 20th, 50th, and 80th percentiles for each year
+sdi_by_year <- x %>% 
+  filter(sex == "Female") %>%
+  group_by(year) %>%
+  summarise(low_sdi = quantile(sdi, c(0.2), na.rm = T),
+            average_sdi = quantile(sdi, c(0.5), na.rm = T),
+            high_sdi = quantile(sdi, c(0.8), na.rm = T)
+  )
+
+#Get trends using the gamma regression model
+ihd_trends <- temporal_change(ihd_bam)
+#Get trends using the gamma regression model (for ACM)
+acm_trends <- temporal_change(acm_bam)
+#Get trends using the Bayesian log-normal model
+ihd_trends_b <- temporal_change(mpost)
+
+#Get P-value for difference in declines btwn males/females in high_sdi countries
+sdi_quantile_name = "high_sdi" #Set SDI of interest
+
+#Get contrast of contrast
+high_sdi_trends_sex_diff_p <- emmeans(ihd_bam, 
+                                      pairwise ~ (sdi & year & sex), 
+                                      at = list(year = c(1980, 2021) %>% rev, 
+                                                sdi = sdi_by_year %>%
+                                                  filter(year %in% c(1980, 2021)) %>%
+                                                  pull(sdi_quantile_name))) %>%
+  pairs(adjust = "none") %>%
+  pairs(adjust = "none") %>% #Get difference in (relative) contrasts
+  data.frame %>%
+  filter(contrast == paste0("(sdi", sdi_by_year %>%
+                              filter(year == 2021) %>%
+                              pull(sdi_quantile_name),
+                            " year2021 Female - sdi",
+                            sdi_by_year %>% filter(year == 1980) %>% pull(sdi_quantile_name),
+                            " year1980 Female) - (sdi",
+                            sdi_by_year %>% filter(year == 2021) %>% pull(sdi_quantile_name),
+                            " year2021 Male - sdi",
+                            sdi_by_year %>% filter(year == 1980) %>% pull(sdi_quantile_name),
+                            " year1980 Male)")) %>% #Filter to the desired row comparing the declines in males/females from 2021 to 1980 in a high SDI country
+  select(p.value) %>%
+  p
+
+```
+
+#### Sex-stratified SDI association with mortality
+
+```{r}
+#Insert an empty label for the figure title (this is relevant for risk factor-attributable mortality)
+label = ""
+overall = vector("list", length = 3)
+i = 1
+
+#Run a for loop to get SDI contrasts (relative and absolute) across 3 years
+for(year_of_analysis in c(1980, 2000, 2021)) {
+
+  sdis_of_interest <- x %>%
+    filter(year == year_of_analysis) %>%
+    pull(sdi) %>%
+    quantile(c(seq(0.2, 0.8, 0.05))) %>%
+    data.frame(sdi = .,
+               pct = names(.))
+
+  #Get SDI contrasts using the frequentist gamma regression model
+  contrasts_df <- sdi_contrasts(ihd_bam)
+  
+  #Get SDI contrasts using the frequentist gamma regression model (for ACM)
+  contrasts_df_acm <- sdi_contrasts(acm_bam)
+  
+  #Get SDI contrasts using the bayesian log-normal model
+  contrasts_df_b <- sdi_contrasts(mpost)
+
+#Get absolute contrasts (using marginaleffects)
+abs_contrasts_df <- data.frame()
+for(sdi_of_interest in sdis_of_interest$sdi) {
+  
+  abs_contrasts_df <- rbind(abs_contrasts_df, ihd_bam %>%
+  avg_comparisons(variables = list(
+    sdi = 
+    c(sdis_of_interest %>% filter(pct == "80%") %>% pull(sdi),
+    sdi_of_interest)
+  ),
+  by = "sex",
+  newdata = datagrid(location = x$location %>% unique %>% rep(2),
+                     sex = c("Male", "Female"),
+                     year = year_of_analysis
+                     )) %>%
+  data.frame %>%
+  rename("pe" = "estimate", 
+         "lci" = "conf.low",
+         "uci" = "conf.high") %>%
+  select(sex, pe, lci, uci) %>%
+  mutate(year = year_of_analysis,
+         compared_to = sdi_of_interest)
+  )
+}
+#Replace NA with zero (for same SDI comparison)
+abs_contrasts_df <- abs_contrasts_df %>%
+  mutate(across(.cols = c("lci", "uci"), ~ 
+                  case_when(is.na(.) ~ 0,
+                            TRUE ~ .)))
+
+
+#Join to SDI percentiles
+abs_contrasts_df <- left_join(abs_contrasts_df %>% 
+                                mutate(compared_to = as.character(compared_to)), 
+          contrasts_df %>%
+            select(sex, compared_to, pe, pct) %>%
+            mutate(compared_to = as.character(compared_to)) %>%
+            rename(rel_pe = pe),
+          by = c("sex", "compared_to")) %>%
+  #Make sure differneces have the correct sign
+  mutate(across(.cols = c("pe", "lci", "uci"),
+                ~ case_when(rel_pe > 1 & pe < 0 ~ . * - 1, 
+                            rel_pe < 1 & pe > 0 ~ . * -1,
+                            TRUE ~ .))) %>%
+  #Make sure the sex factor ordering is consistent with contrasts_df
+  mutate(sex = factor(sex, levels = c("Male", "Female")))
+
+#Add a pe_ci column to abs_contrasts_df
+abs_contrasts_df <- abs_contrasts_df %>%
+  abs_pe_ci(rounding = 1) %>%
+  mutate(pe_ci = pe_ci %>% 
+           str_squish %>% 
+           str_replace("\\( ", "\\("))
+
+#Produce plot
+risk_factor = NULL #This ensures that no attribution label is written for the overall plot
+
+#Relative rates (Frequentist)
+fig <- plot_contrasts(year = year_of_analysis)
+#Relative rates (Bayesian)
+fig_b <- plot_contrasts(contrasts = contrasts_df_b, year = year_of_analysis)
+#Relative rates (ACM)
+fig_acm <- plot_contrasts(contrasts = contrasts_df_acm, year = year_of_analysis)
+#Absolute differences (Frequentist)
+abs_fig <- plot_abs_contrasts(year = year_of_analysis)
+
+
+#Get P-value for how differently each is affected by a low SDI
+male_female_ratio_ratios_p <- emmeans(ihd_bam, pairwise ~ (sdi & year & sex),
+at = list(year = year_of_analysis,
+sdi = sdis_of_interest$sdi %>% range, 
+sex = c("Male", "Female"))) %>%
+pairs(adjust = "none") %>% pairs(adjust = "none") %>%
+data.frame %>%
+filter(contrast == paste0("(sdi", sdis_of_interest$sdi %>% min,
+       " year", year_of_analysis, " Male - sdi", sdis_of_interest$sdi %>% max,
+       " year", year_of_analysis, " Male) - (sdi", sdis_of_interest$sdi %>% min, 
+       " year", year_of_analysis, " Female - sdi", sdis_of_interest$sdi %>% max, " year", year_of_analysis, " Female)")) %>%
+select(p.value) %>% p
+
+#Save list
+overall[[i]] <- list(contrasts = contrasts_df,
+                     acm_contrasts = acm_contrasts_df,
+                     contrasts_b = contrasts_df_b,
+                     abs_contrasts = abs_contrasts_df, 
+                     fig = fig,
+                     fig_b = fig_b,
+                     abs_fig = abs_fig,
+                     ratio_ratios_p = male_female_ratio_ratios_p)
+i = i + 1
+}
+
+#Name the components of the list (begin in 1980, mid in 2000, end in 2021)
+names(overall) <- c("begin", "mid", "end")
+```
+
+### Analysis by risk factor
+
+```{r}
+#riskfactors refers to the way risk factors will be written out in the figures.
+riskfactors <- c("Environmental/occupational risks", "Behavioral risks", "Metabolic risks")
+
+#labels refers to object names
+labels <- c("envocc", "behavioral", "mets")
+
+subgroups <- foreach(risk_factor = riskfactors,
+        label = labels) %do% {
+
+#Model
+ihd_bam_rf <- bam(data = rf %>% filter(riskfactor == risk_factor),
+               method = "fREML", #Use fast REML computation
+              AR.start = ar_ind, #Autocorrelation indicator
+               rho = 0.99, #Autocorrelation coeffecient
+               discrete = TRUE, #Use discretization to speed up computation
+               family = Gamma(link = "log"), #Use a Gamma family with a log link
+               formula = aamr_pe ~ #AAMR (Age-adjusted mortality rate) is the outcome
+                 te(year, sdi, by = sex, k = 10) + #A three-way interaction between year, SDI, and sex
+                 sex + #A main effects for sex (main effects for other continuous variables automatically included by the "te" function)
+                 s(location, bs = "re") #Use random-intercepts for countries.
+)
+
+
+subgroup_year <- foreach(year_of_analysis = c(1980, 2000, 2021)) %do% {
+
+  
+  #Get SDIs of interest
+  sdis_of_interest <- x %>%
+    filter(year == year_of_analysis) %>%
+    pull(sdi) %>%
+    quantile(c(seq(0.2, 0.8, 0.05))) %>%
+    data.frame(sdi = .,
+               pct = names(.))
+  
+  
+          #Apply emmeans to get conditional contrasts by sex
+          contrasts_df <- emmeans(ihd_bam_rf, pairwise ~ sdi|sex|location,
+                                  at = list(year = year_of_analysis,
+                                            location = "France",
+                                            sdi = sdis_of_interest$sdi, 
+                                            sex = c("Male", "Female"))) %>%
+            {.$contrasts} %>%
+            confint(adjust = "none") %>%
+            data.frame %>%
+            filter(contrast %>% str_detect(paste0("- sdi", sdis_of_interest$sdi %>% max))) %>%
+            rename("pe" = "estimate",
+                   "lci" = "lower.CL",
+                   "uci" = "upper.CL") %>%
+            mutate(across(.cols = c("pe", "lci", "uci"),
+                          ~ . %>% exp))
+          
+          
+          #Create a numeric "compared_to" variable
+          contrasts_df$compared_to <- contrasts_df$contrast %>%  
+            word(1, sep = "-") %>%
+            str_remove_all("sdi") %>%
+            as.numeric
+          
+          #Create a compared_to = reference row
+          contrasts_df <- contrasts_df %>%
+add_row(.before = 1,
+compared_to = sdis_of_interest$sdi %>% max,
+contrast = paste0("sdi", sdis_of_interest$sdi %>% max,
+                  " - sdi", sdis_of_interest$sdi %>% max),
+sex = c("Male", "Female") %>% factor,
+pe = 1, lci = 1, uci = 1) %>%
+pe_ci %>%
+mutate(pe_ci = str_replace(pe_ci, "\\(", "\\(95% CI: "))
+          
+          #Add a "comapred_to_percentile" variable
+contrasts_df <- left_join(contrasts_df %>% 
+                            mutate(compared_to = as.character(compared_to)), 
+          sdis_of_interest %>%
+            mutate(sdi = as.character(sdi)),
+          by = c("compared_to" = "sdi")) %>%
+  mutate(compared_to = as.numeric(compared_to))
+          
+          #Plot contrasts
+          fig <- plot_contrasts(year = year_of_analysis)
+          
+          #Get P-value for how differently each is affected by a low SDI
+male_female_ratio_ratios_p <- emmeans(ihd_bam_rf, pairwise ~ (sdi & year & sex),
+at = list(year = year_of_analysis,
+sdi = sdis_of_interest$sdi %>% range, 
+sex = c("Male", "Female"))) %>%
+pairs(adjust = "none") %>% pairs(adjust = "none") %>%
+data.frame %>%
+filter(contrast == paste0("(sdi", sdis_of_interest$sdi %>% min,
+       " year", year_of_analysis, " Male - sdi", sdis_of_interest$sdi %>% max,
+       " year", year_of_analysis, " Male) - (sdi", sdis_of_interest$sdi %>% min, 
+       " year", year_of_analysis, " Female - sdi", sdis_of_interest$sdi %>% max, " year", year_of_analysis, " Female)")) %>%
+select(p.value) %>% p
+          
+          #Save list
+list(contrasts = contrasts_df, 
+     fig = fig,
+     ratio_ratios_p = male_female_ratio_ratios_p)
+}
+
+names(subgroup_year) <- c("begin", "mid", "end")
+subgroup_year
+          
+
+        }
+
+#Name the different outcomes in the list
+names(subgroups) <- labels
+```
+
+## Figure creation
+
+```{r}
+#Create a figures directory if it does not exist
+if(!dir.exists("Figures")) {
+  dir.create("Figures")
+}
+```
+
+### Temporal Marginal rates
+
+#### Produce data required for figure 1
+
+```{r}
+
+if(!file.exists("Marginal Temporal Rates by SDI.RData")) {
+#Setup a cluster for parallel computation (to speed up)
+ihd_mm_trends <- data.frame()
+
+#One for SDI level
+for(sdi_quantile_name in c("low_sdi",
+                           "average_sdi",
+                           "high_sdi"))  {
+
+  ihd_mm_trends_sdi <- data.frame()
+  
+#And a nested one for year
+for(year_of_interest in 1980:2021)  {
+                            ######
+                            ihd_mm_trends_sdi <- rbind(ihd_mm_trends_sdi, ihd_bam %>%
+                              avg_predictions(variables = list(
+                                sdi = sdi_by_year %>% 
+                                  filter(year %in% 
+                                           c(year_of_interest)) %>%
+                                  pull(sdi_quantile_name),
+                                year = year_of_interest,
+                                sex = c("Male", "Female")
+                              ),
+                              by = "sex",
+                              newdata = datagrid(location = x$location %>% unique)) %>%
+                              data.frame %>%
+                              rename("pe" = "estimate", 
+                                     "lci" = "conf.low",
+                                     "uci" = "conf.high") %>%
+                              select(sex, pe, lci, uci) %>%
+                              mutate(sdi_level = sdi_quantile_name,
+                                     year = year_of_interest)
+                            ) %>%
+                              pe_ci(rounding = 1)
+                            }
+  
+  ihd_mm_trends <- rbind(ihd_mm_trends, ihd_mm_trends_sdi)
+  
+}
+
+qsave(ihd_mm_trends, "Marginal Temporal Rates by SDI.RData")
+
+} else {
+  ihd_mm_trends <- qread("Marginal Temporal Rates by SDI.RData")
+}
+```
+
+#### Produce Figure 1 (Marginal rates over time)
+
+```{r}
+#Create a df for the plot
+ihd_mm_trends_plot_df <- ihd_mm_trends
+
+#Arrange factor levels
+ihd_mm_trends_plot_df$sdi_level <- 
+  ihd_mm_trends_plot_df$sdi_level %>%
+  str_replace("_", " ") %>%
+  str_to_title() %>%
+  str_replace("Sdi", "SDI") %>% factor %>%
+  fct_relevel("Low SDI", "Average SDI", "High SDI")
+
+#Arrange sex such that females show up in orange and males in blue
+ihd_mm_trends_plot_df$sex <- ihd_mm_trends_plot_df$sex %>% fct_relevel("Male", "Female")
+
+#Titles
+main_title <- "Figure 1: Sex-stratified trends in age-adjusted IHD mortality across different sociodemographic indices, 1980 to 2021"
+subtitle <- "Rates were averaged over the different countries and territories, which were included in the model as random intercepts."
+#Y-aesthetics
+ytitle <- "Age-adjusted Mortality rates per 100,000"
+ylimits <- c(NA, NA)
+ybreaks <- seq(0, 1000, 20)
+#X-breaks
+yearly_seq <- seq(1980, 2021, 2)
+
+#Plot
+ggplot(data = ihd_mm_trends_plot_df,
+       aes(x = year,
+           y = pe,
+           ymin = lci,
+           ymax = uci,
+           linetype = sdi_level,
+           color = sex,
+           fill = sex,
+           group = interaction(sdi_level, sex))) +
+  geom_line(lwd = 1.2)  +
+  geom_ribbon(alpha = 0.075, color = "transparent") +
+  scale_color_tableau(name = "",
+                      guide = guide_legend(nrow = 1)) +
+  scale_fill_tableau(name = "",
+                     guide = guide_legend(nrow = 1)) +
+  scale_linetype_manual(name = "",
+                        values = c("solid", "dashed", "dotted") %>% rev) +
+  #Add scales
+  scale_x_continuous(
+    name = "Year",
+    expand = c(0, 0),
+    breaks = yearly_seq) +
+  scale_y_continuous(
+    name = ytitle,
+    breaks = ybreaks,
+    limits = ylimits,
+    expand = c(0.02, 0)) +
+  #Add plot title
+  ggtitle(main_title,
+          subtitle = subtitle) +
+  #Theme
+  theme_pubclean() +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold",hjust = 0.0, size = 18),
+        plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.0, color = "grey45"),
+        axis.text.x = element_text(size = 16, face = "bold"),
+        axis.text.y = element_text(size = 20, face = "bold"),
+        axis.title.x = element_text(size = 25, face = "bold"),
+        axis.title.y = element_text(size = 21, face = "bold"),
+        axis.line = element_line(colour = "black", 
+                                 linewidth = 1.2),
+        plot.margin = margin(0.5, 1, 0.5, 1, "cm"),
+        legend.position = "bottom",
+        legend.text = element_text(size = 16, face = "bold"),
+        legend.key.width = unit(4, "cm"),
+        legend.key.height = unit(0.75, "cm"),
+        legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(fill = "transparent")
+  ) +
+  guides(linetype=guide_legend(override.aes=list(fill=NA))
+  )
+
+#Save plot
+ggsave(filename = "Figures/Figure 1.png",
+       dpi = 600,
+       height = 9, width = 16)
+```
+
+### Produce Figures 2 & S1 & S6 (temporal reductions)
+
+```{r}
+
+#Create a for loop to get temporal reductions in AAMR according to SDI using the frequentist and Bayesian models
+foreach(trends_df = list(ihd_trends, ihd_trends_b, acm_trends),
+        fig_no = c("2", "S1", "S6")) %do% {
+
+#Create a df for the plot
+ihd_trends_plot_df <- trends_df
+
+#Arrange factor levels
+ihd_trends_plot_df$sdi_level <- 
+  ihd_trends_plot_df$sdi_level %>%
+  str_replace("_", " ") %>%
+  str_to_title() %>%
+  str_replace("Sdi", "SDI") %>% factor %>%
+  fct_relevel("Low SDI", "Average SDI", "High SDI")
+
+#Arrange sex such that females show up in orange and males in blue
+ihd_trends_plot_df$sex <- ihd_trends_plot_df$sex %>% fct_relevel("Male", "Female")
+
+
+#Titles
+main_title <- paste0(fig_no, ": Sex-stratified trends in age-adjusted IHD mortality across different sociodemographic indices, 1980 to 2021")
+subtitle <- "The black line at 1 indicates no change in mortality since 1980. The lower the line on the Y-axis, the greater the reduction in mortality. For example, values of 0.8 and 0.6 indicate reductions of 20% and 40% respectively.\nThe low, average, and high sociodemographic index (SDI) groups correspond to the 20th, 50th, and 80th percentiles respectively."
+#Y-aesthetics
+ytitle <- "Mortality rate ratio"
+ylimits <- c(NA, NA)
+ybreaks <- seq(0, 2, 0.1)
+#X-breaks
+yearly_seq <- seq(1980, 2021, 2)
+
+#Plot
+ggplot(data = ihd_trends_plot_df,
+       aes(x = compared_to,
+           y = pe,
+           ymin = lci,
+           ymax = uci,
+           linetype = sdi_level,
+           color = sex,
+           fill = sex,
+           group = interaction(sdi_level, sex))) +
+  geom_hline(yintercept = 1, lwd = 1.2) +
+  geom_ribbon(alpha = 0.075, color = "transparent") +
+  geom_line(lwd = 1.2)  +
+  scale_color_tableau(name = "",
+                     guide = guide_legend(nrow = 1)) +
+  scale_fill_tableau(name = "",
+                      guide = guide_legend(nrow = 1)) +
+  scale_linetype_manual(name = "",
+                          values = c("solid", "dashed", "dotted") %>% rev) +
+  #Add scales
+  scale_x_continuous(
+    name = "Year",
+    expand = c(0, 0),
+    breaks = yearly_seq) +
+  scale_y_continuous(
+    name = ytitle,
+    breaks = ybreaks,
+    limits = ylimits,
+    expand = c(0.03, 0)) +
+  #Add plot title
+  ggtitle(main_title,
+          subtitle = subtitle) +
+  #Theme
+  theme_pubclean() +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold",hjust = 0.0, size = 18),
+        plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.0, color = "grey45"),
+        axis.text.x = element_text(size = 16, face = "bold"),
+        axis.text.y = element_text(size = 20, face = "bold"),
+        axis.title.x = element_text(size = 25, face = "bold"),
+        axis.title.y = element_text(size = 21, face = "bold"),
+        axis.line = element_line(colour = "black", linewidth = 1.2),
+        plot.margin = margin(0.5, 1, 0.5, 1, "cm"),
+        legend.position = "bottom",
+        legend.text = element_text(size = 16, face = "bold"),
+        legend.key.width = unit(4, "cm"),
+        legend.key.height = unit(0.75, "cm"),
+        legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(fill = "transparent")
+        ) +
+  guides(linetype=guide_legend(override.aes=list(fill=NA))
+         )
+
+#Save plot
+ggsave(filename = paste0("Figures/Figure ", fig_no, ".png"),
+  dpi = 600,
+  height = 9, width = 16)
+}
+```
+
+### Produce Figures 3 & S2-S5 & S7
+
+```{r}
+#Build a foreach loop for figures 2-5 since they're very similar
+foreach(fig_no = lapply(c(3, "S2", "S3", "S4", "S5", "S7"), 
+                        function(x) paste0(x, c("A", "B", "C"))) %>%
+          unlist,
+        year = c("1980", "2000", "2021") %>% 
+          rep(times = 6),
+        sdi_0.8 = x %>% 
+          filter(year %in% c(1980, 2000, 2021)) %>%
+          group_by(year) %>% 
+          summarise(quantile(sdi, 0.8)) %>% 
+          pull %>%
+          rep(times = 6) %>%
+          round(2) %>% 
+          format(nsmall = 2),
+        relevant_df = list(overall$begin$contrasts, 
+                           overall$mid$contrasts, 
+                           overall$end$contrasts,
+                           overall$begin$contrasts_b, 
+                           overall$mid$contrasts_b, 
+                           overall$end$contrasts_b,
+                             subgroups$behavioral$begin$contrasts,
+                           subgroups$behavioral$mid$contrasts,
+                             subgroups$behavioral$end$contrasts, 
+                             subgroups$mets$begin$contrasts,
+                           subgroups$mets$mid$contrasts,
+                             subgroups$mets$end$contrasts, 
+                             subgroups$envocc$begin$contrasts,
+                           subgroups$envocc$mid$contrasts,
+                             subgroups$envocc$end$contrasts,
+                           overall$begin$contrasts_acm, 
+                           overall$mid$contrasts_acm, 
+                           overall$end$contrasts_acm),
+        relevant_fig = list(
+                   overall$begin$fig, 
+                   overall$mid$fig, 
+                   overall$end$fig,
+                   overall$begin$fig_b, 
+                   overall$mid$fig_b, 
+                   overall$end$fig_b,
+                   subgroups$behavioral$begin$fig, 
+                   subgroups$behavioral$mid$fig,
+                   subgroups$behavioral$end$fig, 
+                   subgroups$mets$begin$fig, 
+                   subgroups$mets$mid$fig,
+                   subgroups$mets$end$fig, 
+                   subgroups$envocc$begin$fig, 
+                   subgroups$envocc$mid$fig,
+                   subgroups$envocc$end$fig,
+                   overall$begin$fig_acm, 
+                   overall$mid$fig_acm, 
+                   overall$end$fig_acm)
+          ) %do% {
+
+#First, rearrange table and label it properly
+gtable <- relevant_df %>% 
+  select(pct, compared_to, sex, pe_ci) %>% #Select the relevant columns
+  filter(pct %in% c("20%", "30%", "40%", "50%", "60%", "70%")) %>% #Select SDIs for comparison
+  mutate(pct = pct %>% str_replace("%", "th percentile"),
+         compared_to = round(compared_to, 2) %>% format(nsmall = 2),
+         pe_ci = pe_ci %>% str_remove("95% CI: ")) %>% #Remove the 95% CI within rows since it'll be in the heading
+  pivot_wider(names_from = sex, #Widen the table to structure it properly for the graph
+              values_from = pe_ci) %>%
+    mutate(ratio_of_ratios = {if(year != "1980" & fig_no != "S5C") (
+      as.numeric(word(Female, 1)) / as.numeric(word(Male, 1))) %>%
+        round(2) %>%
+        {100*(. - 1)} else NULL}) %>%
+  rename(any_of(c("SDI percentile used for comparison" = "pct", #Rename columns
+         "SDI at this percentile" = "compared_to",
+         "Rate ratio (95% CI) in males" = "Male",
+         "Rate ratio (95% CI) in females" = "Female",
+         "Excess association among females (%)" = "ratio_of_ratios"))) %>%
+  gt %>% #Convert to table
+  tab_spanner(label = paste0("Sex-stratified increase in mortality associated with a lower SDI, using the SDI value at the 80th percentile ", "in ", year, " (", sdi_0.8, ") ", "as the reference point"),
+              columns = 1:ifelse(year == "1980" | fig_no == "S5C", 4, 5)) %>%
+  cols_align("center") %>% #Center contents
+  opt_table_font(weight = "bolder") %>%  #Make content bold
+  cols_width(everything() ~ ifelse(year == 1980, px(3000), px(2650))) %>%
+  tab_options(table.font.size = ifelse(year == 1980, 150, 175)) %>% #Increase font size
+  as_ggplot(vwidth = 18000) #Make it wider
+
+#This combines the above table with the figure
+fig <- wrap_plots(relevant_fig +
+                    ggtitle(paste0("Figure ", fig_no,
+                                   ": ", relevant_fig$labels$title) %>%
+                    ifelse(fig_no %>% str_detect("S7"),
+                           str_replace(., "IHD", "all-cause"), .)) ,
+                  gtable,
+                  heights = c(ifelse(year == 1980, 2.5, 2),
+                              1))
+
+#Save the output
+ggsave(plot = fig,
+       filename = paste0("Figures/Figure ", fig_no, ".png"),
+       width = 16, height = 9, dpi = 600)
+            }
+```
+
+### Produce Figure 4
+
+```{r}
+#Produce figure 4
+foreach(fig_no = lapply(4, 
+                        function(x) paste0(x, c("A", "B", "C"))) %>%
+          unlist,
+        year = c("1980", "2000", "2021"),
+        sdi_0.8 = x %>% 
+          filter(year %in% c(1980, 2000, 2021)) %>% 
+          group_by(year) %>% 
+          summarise(quantile(sdi, 0.8)) %>% 
+          pull %>%
+          round(2) %>% 
+          format(nsmall = 2),
+        relevant_list = list(overall$begin, overall$mid, overall$end)
+          ) %do% {
+
+#First, rearrange table and label it properly
+gtable <- relevant_list$abs_contrasts %>% 
+  select(pct, compared_to, sex, pe_ci) %>% #Select the relevant columns
+  filter(pct %in% c("20%", "30%", "40%", "50%", "60%", "70%")) %>% #Select SDIs for comparison
+  mutate(pct = pct %>% str_replace("%", "th percentile"),
+         compared_to = round(compared_to %>% as.numeric, 2) %>% format(nsmall = 2),
+         pe_ci = pe_ci %>% str_remove("95% CI: ")) %>% #Remove the 95% CI within rows since it'll be in the heading
+  pivot_wider(names_from = sex, #Widen the table to structure it properly for the graph
+              values_from = pe_ci) %>%
+  rename(any_of(c("SDI percentile used for comparison" = "pct", #Rename columns
+         "SDI at this percentile" = "compared_to",
+         "Absolute difference (95% CI) in males" = "Male",
+         "Absolute difference (95% CI) in females" = "Female"))) %>%
+  gt %>% #Convert to table
+  tab_spanner(label = paste0("Sex-stratified increase in mortality associated with a lower SDI, using the SDI value at the 80th percentile ", "in ", year, " (", sdi_0.8, ") ", "as the reference point"),
+              columns = 1:4) %>%
+  cols_align("center") %>% #Center contents
+  opt_table_font(weight = "bolder") %>%  #Make content bold
+  cols_width(everything() ~ px(3000)) %>%
+  tab_options(table.font.size = 170) %>% #Increase font size
+  bstfun::as_ggplot(vwidth = 18000) #Make it wider
+
+#This combines the above table with the figure
+fig <- wrap_plots(relevant_list$abs_fig +
+                    ggtitle(paste0("Figure ", fig_no,
+                                   ": ", relevant_list$abs_fig$labels$title)),
+                  gtable,
+                  heights = c(2,1))
+
+#Save the output
+ggsave(plot = fig,
+       filename = paste0("Figures/Figure ", fig_no, ".png"),
+       width = 16, height = 9, dpi = 600)
+            }
+```
+
+## Save data for rendering
+
+```{r}
+save(x, overall, ihd_mm_trends,
+     subgroups, ihd_trends, acm_trends,
+     file = "Data for Rendering.RData")
+```
